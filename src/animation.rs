@@ -459,7 +459,7 @@ fn decode_mp4_from<R: std::io::Read + std::io::Seek>(
     limit: usize,
 ) -> Option<Decoded> {
     let mut mp4 = mp4::Mp4Reader::read_header(reader, size).ok()?;
-    let (track_id, timescale, sps, pps, count) = {
+    let (track_id, timescale, shift, end, sps, pps, count) = {
         let track = mp4
             .tracks()
             .values()
@@ -467,11 +467,14 @@ fn decode_mp4_from<R: std::io::Read + std::io::Seek>(
         (
             track.track_id(),
             u64::from(track.timescale().max(1)),
+            edit_shift(track) as i64,
+            track.duration(),
             track.sequence_parameter_set().ok()?.to_vec(),
             track.picture_parameter_set().ok()?.to_vec(),
             track.sample_count(),
         )
     };
+    let end = (end.as_nanos() * u128::from(timescale) / 1_000_000_000) as i64;
     // Flushing after every packet, the default, breaks streams with
     // B-frames: the decoder then gives up at the first one. Reordered frames
     // come out on their own and the rest with `flush_remaining`.
@@ -481,44 +484,67 @@ fn decode_mp4_from<R: std::io::Read + std::io::Seek>(
             .flush_after_decode(openh264::decoder::Flush::NoFlush),
     )
     .ok()?;
-    let mut frames: Vec<(ColorImage, Duration)> = Vec::new();
-    let mut delays: std::collections::VecDeque<Duration> = std::collections::VecDeque::new();
+    let mut images = Vec::new();
+    // Presentation times of the samples fed. H.264 returns frames in display
+    // order, so sorting these lines them up with the images.
+    let mut times: Vec<i64> = Vec::new();
     // Send parameter sets and samples to the decoder in Annex B format.
     let mut parameters = Vec::new();
     push_annex_b(&mut parameters, &sps);
     push_annex_b(&mut parameters, &pps);
     let _ = decoder.decode(&parameters);
+    let mut truncated = false;
     for sample_id in 1..=count {
-        if frames.len() >= limit {
+        if images.len() >= limit {
+            truncated = true;
             break;
         }
         let Ok(Some(sample)) = mp4.read_sample(track_id, sample_id) else {
             break;
         };
-        let delay =
-            Duration::from_millis((u64::from(sample.duration) * 1000 / timescale).clamp(20, 1000));
-        delays.push_back(delay);
+        times.push(sample.start_time as i64 + i64::from(sample.rendering_offset));
         let mut annex_b = Vec::with_capacity(sample.bytes.len() + 16);
         avcc_to_annex_b(&mut annex_b, &sample.bytes);
-        if let Ok(Some(yuv)) = decoder.decode(&annex_b) {
-            let delay = delays.pop_front().unwrap_or(delay);
-            if let Some(frame) = frame_of(&yuv, delay) {
-                frames.push(frame);
-            }
+        if let Ok(Some(yuv)) = decoder.decode(&annex_b)
+            && let Some(image) = frame_of(&yuv)
+        {
+            images.push(image);
         }
     }
     if let Ok(rest) = decoder.flush_remaining() {
         for yuv in &rest {
-            if frames.len() >= limit {
+            if images.len() >= limit {
+                truncated = true;
                 break;
             }
-            let delay = delays.pop_front().unwrap_or(Duration::from_millis(66));
-            if let Some(frame) = frame_of(yuv, delay) {
-                frames.push(frame);
+            if let Some(image) = frame_of(yuv) {
+                images.push(image);
             }
         }
     }
-    (!frames.is_empty()).then_some(Decoded { frames })
+    if images.is_empty() {
+        return None;
+    }
+    times.sort_unstable();
+    let delay = |ticks: i64| {
+        Duration::from_millis(
+            (u64::try_from(ticks.max(0)).unwrap_or(0) * 1000 / timescale).clamp(20, 1000),
+        )
+    };
+    let mut frames = Vec::with_capacity(images.len());
+    for (index, image) in images.into_iter().enumerate() {
+        let delay = if let Some(next) = times.get(index + 1) {
+            delay(next - times[index])
+        } else if truncated {
+            frames
+                .last()
+                .map_or(Duration::from_millis(20), |(_, delay)| *delay)
+        } else {
+            delay(end - (times[index] - shift))
+        };
+        frames.push((image, delay));
+    }
+    Some(Decoded { frames })
 }
 
 /// What an MP4 says about itself, with a picture from its start: what the
@@ -628,10 +654,7 @@ fn enforce_budget(animations: &mut Animations, path: &Path, now: Instant) {
 }
 
 /// Converts and scales one decoded frame.
-fn frame_of(
-    yuv: &openh264::decoder::DecodedYUV<'_>,
-    delay: Duration,
-) -> Option<(ColorImage, Duration)> {
+fn frame_of(yuv: &openh264::decoder::DecodedYUV<'_>) -> Option<ColorImage> {
     use openh264::formats::YUVSource;
 
     let (width, height) = yuv.dimensions();
@@ -653,7 +676,25 @@ fn frame_of(
             image::imageops::FilterType::Triangle,
         )
     };
-    Some((to_color_image(&scaled), delay))
+    Some(to_color_image(&scaled))
+}
+
+/// Media time an MP4's edit list starts showing from, in track time units.
+pub(crate) fn edit_shift(track: &mp4::Mp4Track) -> u64 {
+    track
+        .trak
+        .edts
+        .as_ref()
+        .and_then(|edts| edts.elst.as_ref())
+        .and_then(|elst| {
+            // An empty edit, a delay before the track starts, has a
+            // media time of -1.
+            elst.entries
+                .iter()
+                .map(|entry| entry.media_time)
+                .find(|&time| time != u64::from(u32::MAX) && time != u64::MAX)
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn push_annex_b(out: &mut Vec<u8>, nal: &[u8]) {
@@ -860,13 +901,13 @@ mod tests {
     }
 
     #[test]
-    fn an_mp4_made_by_ffmpeg_decodes_in_process() {
+    fn a_variable_duration_mp4_with_b_frames_keeps_its_timing() {
         if !can_play_video() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("zapfast-mp4-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("zapfast-mp4-vfr-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("clip.mp4");
+        let path = dir.join("variable.mp4");
         let made = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -875,10 +916,12 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=duration=2:size=64x48:rate=10",
+                "testsrc=duration=3:size=64x48:rate=10",
+                "-vf",
+                "select='not(eq(mod(n,6),2))*not(eq(mod(n,6),4))*not(eq(mod(n,6),5))'",
+                "-fps_mode",
+                "vfr",
             ])
-            // B-frames used to break the decoder after a handful of samples,
-            // so a clip looped as only those frames.
             .args(["-c:v", "libx264", "-bf", "2", "-pix_fmt", "yuv420p"])
             .arg(&path)
             .status()
@@ -888,12 +931,23 @@ mod tests {
             return;
         }
         let decoded = decode(&path, MAX_FRAMES).expect("decodes");
-        // Twenty frames at 10 fps, including every one after a B-frame.
-        assert_eq!(decoded.frames.len(), 20);
-        assert_eq!(decoded.frames[0].1, Duration::from_millis(100));
-        let total: Duration = decoded.frames.iter().map(|(_, delay)| *delay).sum();
-        assert_eq!(total, Duration::from_secs(2), "the whole loop plays");
+        let delays: Vec<u128> = decoded
+            .frames
+            .iter()
+            .map(|(_, delay)| delay.as_millis())
+            .collect();
+        // The frames are 100, 200, and 300 ms apart in display order.
+        // Decode order would put the durations in a different order.
+        assert_eq!(
+            delays,
+            [
+                100, 200, 300, 100, 200, 300, 100, 200, 300, 100, 200, 300, 100, 200, 100
+            ]
+        );
+        assert_eq!(decoded.frames.len(), 15);
         assert_eq!(decoded.frames[0].0.size, [64, 48]);
+        let total: Duration = decoded.frames.iter().map(|(_, delay)| *delay).sum();
+        assert_eq!(total, Duration::from_millis(2800), "the whole loop plays");
         let _ = std::fs::remove_dir_all(dir);
     }
 
