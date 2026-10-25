@@ -2222,6 +2222,8 @@ pub struct Gif {
     pub id: String,
     /// Downloaded still-frame path.
     pub still: Option<PathBuf>,
+    /// Downloaded animated thumbnail shown while the tile is hovered.
+    pub animated: Option<PathBuf>,
     pub mp4: String,
     pub width: u32,
     pub height: u32,

@@ -18247,6 +18247,7 @@ mod tests {
             Action::SendGif(Gif {
                 id: "fixture".into(),
                 still: None,
+                animated: None,
                 mp4: "https://example.invalid/fixture.mp4".into(),
                 width: 2,
                 height: 2,
@@ -19206,6 +19207,7 @@ mod tests {
                     3 => Action::SendGif(Gif {
                         id: "fixture".into(),
                         still: None,
+                        animated: None,
                         mp4: "https://example.invalid/fixture.mp4".into(),
                         width: 2,
                         height: 2,

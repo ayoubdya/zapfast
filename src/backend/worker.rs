@@ -11995,7 +11995,11 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
-/// Searches GIPHY and downloads result stills. Empty queries list trending GIFs.
+/// A search result with the still and animated thumbnail URLs to fetch.
+type GifResult = (Gif, Option<String>, Option<(String, &'static str)>);
+
+/// Searches GIPHY and downloads result stills and animated thumbnails. Empty
+/// queries list trending GIFs.
 fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError> {
     let plain = |message: String| GifError {
         message,
@@ -12045,7 +12049,7 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
         .as_array()
         .ok_or_else(|| plain("GIPHY response contained no results".to_owned()))?;
     std::fs::create_dir_all(dir).map_err(|error| plain(error.to_string()))?;
-    let mut gifs: Vec<(Gif, Option<String>)> = data
+    let mut gifs: Vec<GifResult> = data
         .iter()
         .filter_map(|item| {
             let id = item["id"].as_str()?.to_owned();
@@ -12064,6 +12068,8 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
                 ],
                 "url",
             );
+            // A small WebP preview decodes in-process; an MP4 is the fallback.
+            let animated = gif_rendition(images);
             let number = |name: &str| {
                 images["fixed_width"][name]
                     .as_str()
@@ -12074,38 +12080,79 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
                 Gif {
                     id,
                     still: None,
+                    animated: None,
                     mp4,
                     width: number("width"),
                     height: number("height"),
                 },
                 still,
+                animated,
             ))
         })
         .collect();
     std::thread::scope(|scope| {
-        for (gif, still) in &mut gifs {
-            let Some(url) = still.clone() else {
-                continue;
-            };
-            let path = dir.join(format!("{}.jpg", sanitize(&gif.id)));
-            if path.exists() {
-                gif.still = Some(path);
+        for (gif, still, animated) in &mut gifs {
+            let id = sanitize(&gif.id);
+            let still_path = still.as_ref().map(|_| dir.join(format!("{id}.jpg")));
+            let animated_path = animated
+                .as_ref()
+                .map(|(_, extension)| dir.join(format!("{id}.{extension}")));
+            if let Some(path) = &still_path
+                && path.exists()
+            {
+                gif.still = Some(path.clone());
+            }
+            if let Some(path) = &animated_path
+                && path.exists()
+            {
+                gif.animated = Some(path.clone());
+            }
+            let still_needed = still.is_some() && gif.still.is_none();
+            let animated_needed = animated.is_some() && gif.animated.is_none();
+            if !still_needed && !animated_needed {
                 continue;
             }
-            let slot = &mut gif.still;
+            let still = still.take();
+            let animated = animated.take();
+            let still_slot = &mut gif.still;
+            let animated_slot = &mut gif.animated;
             scope.spawn(move || {
-                let fetched = ureq::get(&url)
-                    .call()
-                    .and_then(|mut response| response.body_mut().read_to_vec());
-                if let Ok(bytes) = fetched
-                    && std::fs::write(&path, bytes).is_ok()
+                if let Some(url) = still
+                    && let Some(path) = still_path
                 {
-                    *slot = Some(path);
+                    *still_slot = fetch_gif(&url, &path);
+                }
+                if let Some((url, _)) = animated
+                    && let Some(path) = animated_path
+                {
+                    *animated_slot = fetch_gif(&url, &path);
                 }
             });
         }
     });
-    Ok(gifs.into_iter().map(|(gif, _)| gif).collect())
+    Ok(gifs.into_iter().map(|(gif, _, _)| gif).collect())
+}
+
+/// The animated rendition for a result tile: a small WebP, else an MP4.
+fn gif_rendition(images: &serde_json::Value) -> Option<(String, &'static str)> {
+    let pick = |names: &[&str], field: &str| {
+        names
+            .iter()
+            .find_map(|name| images[*name][field].as_str().map(str::to_owned))
+    };
+    pick(&["fixed_width_small", "fixed_width"], "webp")
+        .map(|url| (url, "webp"))
+        .or_else(|| pick(&["fixed_width_small", "fixed_width"], "mp4").map(|url| (url, "mp4")))
+}
+
+/// Downloads one GIF thumbnail, returning its path once written.
+fn fetch_gif(url: &str, path: &Path) -> Option<PathBuf> {
+    let bytes = ureq::get(url)
+        .call()
+        .and_then(|mut response| response.body_mut().read_to_vec())
+        .ok()?;
+    std::fs::write(path, bytes).ok()?;
+    Some(path.to_path_buf())
 }
 
 /// Copies a sent attachment to media storage and builds its archive row.
@@ -12762,6 +12809,21 @@ fn clear_boundary(read: crate::archive::Result<Vec<Message>>) -> Option<i64> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Tiles keep a small animated WebP, falling back to the MP4 rendition.
+    #[test]
+    fn gif_thumbnails_prefer_webp_then_mp4() {
+        let webp = serde_json::json!({
+            "fixed_width_small": {"webp": "small.webp", "mp4": "small.mp4"}
+        });
+        assert_eq!(gif_rendition(&webp), Some(("small.webp".into(), "webp")));
+        let wide = serde_json::json!({"fixed_width": {"webp": "wide.webp"}});
+        assert_eq!(gif_rendition(&wide), Some(("wide.webp".into(), "webp")));
+        let mp4 = serde_json::json!({
+            "fixed_width_small": {"webp": null, "mp4": "small.mp4"}
+        });
+        assert_eq!(gif_rendition(&mp4), Some(("small.mp4".into(), "mp4")));
+    }
 
     /// A failed number check leaves contacts and conversation state unchanged.
     #[tokio::test]
@@ -20940,6 +21002,7 @@ mod receipt_tests {
         let gif = Gif {
             id: "fixture-gif".into(),
             still: None,
+            animated: None,
             mp4: "https://example.invalid/fixture.mp4".into(),
             width: 2,
             height: 2,

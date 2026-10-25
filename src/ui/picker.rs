@@ -1054,7 +1054,27 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
                         if ui.is_rect_visible(rect) {
                             ui.painter().rect_filled(rect, 6.0, palette.surface);
-                            if let Some(still) = &gif.still {
+                            // Hovering plays a small WebP preview; the still
+                            // stays underneath while it decodes or fails.
+                            let playing = gif
+                                .animated
+                                .as_ref()
+                                .filter(|_| response.hovered())
+                                .and_then(|path| {
+                                    match crate::animation::frame(ui, path, rect, true) {
+                                        crate::animation::Frame::Ready(texture) => Some(texture),
+                                        _ => None,
+                                    }
+                                });
+                            if let Some(texture) = playing {
+                                egui::Image::from_texture(egui::load::SizedTexture::new(
+                                    texture.id(),
+                                    texture.size_vec2(),
+                                ))
+                                .fit_to_exact_size(size)
+                                .corner_radius(6.0)
+                                .paint_at(ui, rect);
+                            } else if let Some(still) = &gif.still {
                                 widgets::file_image(ui, still)
                                     .fit_to_exact_size(size)
                                     .corner_radius(6.0)
