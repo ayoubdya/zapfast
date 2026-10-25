@@ -12155,7 +12155,19 @@ fn fetch_gif(url: &str, path: &Path) -> Option<PathBuf> {
         .call()
         .and_then(|mut response| response.body_mut().read_to_vec())
         .ok()?;
-    std::fs::write(path, bytes).ok()?;
+    store_gif(path, &bytes)
+}
+
+/// Stores a downloaded GIF thumbnail only after all of its bytes are on disk.
+fn store_gif(path: &Path, bytes: &[u8]) -> Option<PathBuf> {
+    let temporary = temporary_attachment_path(path);
+    let _staged = Staged(temporary.clone());
+    std::fs::write(&temporary, bytes).ok()?;
+    // Windows does not replace an existing destination during rename. A file
+    // already at the cache path came from another completed fetch.
+    if std::fs::rename(&temporary, path).is_err() && !path.is_file() {
+        return None;
+    }
     Some(path.to_path_buf())
 }
 
@@ -12827,6 +12839,37 @@ mod tests {
             "fixed_width_small": {"webp": null, "mp4": "small.mp4"}
         });
         assert_eq!(gif_rendition(&mp4), Some(("small.mp4".into(), "mp4")));
+    }
+
+    /// A GIF thumbnail reaches its cache path only once it is fully written.
+    #[test]
+    fn gif_cache_writes_are_published_after_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb.webp");
+        assert_eq!(store_gif(&path, b"complete"), Some(path.clone()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete");
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
+        );
+    }
+
+    /// A failed GIF thumbnail publish leaves no staging file behind.
+    #[test]
+    fn failed_gif_cache_publish_leaves_no_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thumb.webp");
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(store_gif(&path, b"partial"), None);
+        assert!(path.is_dir());
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
+        );
     }
 
     /// A failed number check leaves contacts and conversation state unchanged.
