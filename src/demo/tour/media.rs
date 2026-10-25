@@ -45,6 +45,7 @@ pub fn populate(app: &mut App) -> Result<()> {
             id: format!("tour-{index}"),
             still: Some(stock::save(&dir, &format!("reaction-{index}.jpg"), still)),
             animated: Some(animated.clone()),
+            animated_source: None,
             mp4: String::new(),
             width: 320,
             height: 240,

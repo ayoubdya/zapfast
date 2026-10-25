@@ -7184,6 +7184,20 @@ impl Worker {
                     let _ = commands.send(Command::GifResults { query, results });
                 });
             }
+            Command::FetchGifAnimation { id, url, extension } => {
+                let commands = self.commands.clone();
+                let dir = self.dirs.cache.join("gifs");
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = gif_path(&dir, &id, &extension);
+                    let path = if path.exists() {
+                        Some(path)
+                    } else {
+                        fetch_gif(&url, &path)
+                    };
+                    let _ = commands.send(Command::GifAnimated { id, path });
+                });
+            }
             Command::ReceiptsPrivacy { disabled } => {
                 self.emit(Event::ReceiptsPrivacy { disabled });
             }
@@ -7335,6 +7349,9 @@ impl Worker {
             }
             Command::GifResults { query, results } => {
                 self.emit(Event::Gifs { query, results });
+            }
+            Command::GifAnimated { id, path } => {
+                self.emit(Event::GifAnimated { id, path });
             }
             Command::ViewStickerPack { chat, message } => self.view_sticker_pack(&chat, &message),
             Command::StickerPackViewed { result } => {
@@ -11995,11 +12012,11 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
-/// A search result with the still and animated thumbnail URLs to fetch.
+/// A search result with its still and animated renditions.
 type GifResult = (Gif, Option<String>, Option<(String, &'static str)>);
 
-/// Searches GIPHY and downloads result stills and animated thumbnails. Empty
-/// queries list trending GIFs.
+/// Searches GIPHY and downloads result stills. Animated previews are fetched
+/// when their tiles first show. Empty queries list trending GIFs.
 fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError> {
     let plain = |message: String| GifError {
         message,
@@ -12070,6 +12087,9 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
             );
             // A small WebP preview decodes in-process; an MP4 is the fallback.
             let animated = gif_rendition(images);
+            let animated_source = animated
+                .as_ref()
+                .map(|(url, extension)| (url.clone(), (*extension).to_owned()));
             let number = |name: &str| {
                 images["fixed_width"][name]
                     .as_str()
@@ -12081,6 +12101,7 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
                     id,
                     still: None,
                     animated: None,
+                    animated_source,
                     mp4,
                     width: number("width"),
                     height: number("height"),
@@ -12092,11 +12113,10 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
         .collect();
     std::thread::scope(|scope| {
         for (gif, still, animated) in &mut gifs {
-            let id = sanitize(&gif.id);
-            let still_path = still.as_ref().map(|_| dir.join(format!("{id}.jpg")));
+            let still_path = still.as_ref().map(|_| gif_path(dir, &gif.id, "jpg"));
             let animated_path = animated
                 .as_ref()
-                .map(|(_, extension)| dir.join(format!("{id}.{extension}")));
+                .map(|(_, extension)| gif_path(dir, &gif.id, extension));
             if let Some(path) = &still_path
                 && path.exists()
             {
@@ -12107,34 +12127,26 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
             {
                 gif.animated = Some(path.clone());
             }
-            let still_needed = still.is_some() && gif.still.is_none();
-            let animated_needed = animated.is_some() && gif.animated.is_none();
-            if !still_needed && !animated_needed {
+            if still.is_none() || gif.still.is_some() {
                 continue;
             }
-            let still = if still_needed { still.take() } else { None };
-            let animated = if animated_needed {
-                animated.take()
-            } else {
-                None
-            };
+            let still = still.take();
             let still_slot = &mut gif.still;
-            let animated_slot = &mut gif.animated;
             scope.spawn(move || {
                 if let Some(url) = still
                     && let Some(path) = still_path
                 {
                     *still_slot = fetch_gif(&url, &path);
                 }
-                if let Some((url, _)) = animated
-                    && let Some(path) = animated_path
-                {
-                    *animated_slot = fetch_gif(&url, &path);
-                }
             });
         }
     });
     Ok(gifs.into_iter().map(|(gif, _, _)| gif).collect())
+}
+
+/// Where one GIF result's rendition lives in the search cache.
+fn gif_path(dir: &Path, id: &str, extension: &str) -> PathBuf {
+    dir.join(format!("{}.{}", sanitize(id), safe_extension(extension)))
 }
 
 /// The animated rendition for a result tile: a small WebP, else an MP4.
@@ -12870,6 +12882,33 @@ mod tests {
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
         );
+    }
+
+    /// A cached GIF animation is returned without a network fetch.
+    #[tokio::test]
+    async fn cached_gif_animation_is_returned_without_fetching() {
+        let (mut worker, events, mut commands, _) = super::receipt_tests::worker();
+        let dir = worker.dirs.cache.join("gifs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = dir.join("fixture.webp");
+        std::fs::write(&expected, b"animation").unwrap();
+        worker
+            .handle_command(Command::FetchGifAnimation {
+                id: "fixture".into(),
+                url: "https://example.invalid/missing.webp".into(),
+                extension: "webp".into(),
+            })
+            .await;
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), commands.recv())
+            .await
+            .expect("animation command")
+            .expect("animation command");
+        worker.handle_command(command).await;
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::GifAnimated { id, path: Some(path) }
+                if id == "fixture" && path == expected
+        )));
     }
 
     /// A failed number check leaves contacts and conversation state unchanged.
@@ -21050,6 +21089,7 @@ mod receipt_tests {
             id: "fixture-gif".into(),
             still: None,
             animated: None,
+            animated_source: None,
             mp4: "https://example.invalid/fixture.mp4".into(),
             width: 2,
             height: 2,

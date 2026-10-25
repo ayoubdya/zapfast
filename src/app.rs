@@ -602,6 +602,8 @@ pub struct App {
     pub selection_view: std::sync::Arc<std::sync::Mutex<Option<egui::Rect>>>,
     pub gif_query: String,
     pub gif_results: Vec<Gif>,
+    /// GIF ids whose animated preview was requested for the current results.
+    pub gif_requested: HashSet<String>,
     /// Whether a GIF search is active.
     pub gif_pending: bool,
     pub gif_error: Option<GifError>,
@@ -1441,6 +1443,7 @@ impl App {
             selection_view: Default::default(),
             gif_query: String::new(),
             gif_results: Vec::new(),
+            gif_requested: HashSet::new(),
             gif_pending: false,
             gif_error: None,
             sticker_shelf: StickerShelf::default(),
@@ -3708,13 +3711,20 @@ impl App {
                     match results {
                         Ok(results) => {
                             self.gif_results = results;
+                            self.gif_requested.clear();
                             self.gif_error = None;
                         }
                         Err(error) => {
                             self.gif_results.clear();
+                            self.gif_requested.clear();
                             self.gif_error = Some(error);
                         }
                     }
+                }
+            }
+            Event::GifAnimated { id, path } => {
+                if let Some(gif) = self.gif_results.iter_mut().find(|gif| gif.id == id) {
+                    gif.animated = path;
                 }
             }
             Event::Stickers {
@@ -7687,6 +7697,10 @@ impl App {
                     query,
                     key: self.settings.effective_giphy_key().unwrap_or_default(),
                 });
+            }
+            Action::FetchGifAnimation { id, url, extension } => {
+                self.backend
+                    .send(Command::FetchGifAnimation { id, url, extension });
             }
             Action::SendGif(gif) => {
                 if let Some(chat) = self.open_chat.clone() {
@@ -18248,6 +18262,7 @@ mod tests {
                 id: "fixture".into(),
                 still: None,
                 animated: None,
+                animated_source: None,
                 mp4: "https://example.invalid/fixture.mp4".into(),
                 width: 2,
                 height: 2,
@@ -19208,6 +19223,7 @@ mod tests {
                         id: "fixture".into(),
                         still: None,
                         animated: None,
+                        animated_source: None,
                         mp4: "https://example.invalid/fixture.mp4".into(),
                         width: 2,
                         height: 2,

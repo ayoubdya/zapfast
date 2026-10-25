@@ -3690,6 +3690,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                         id: format!("demo{index}"),
                         still: Some(still.clone()),
                         animated: Some(animated.clone()),
+                        animated_source: None,
                         mp4: String::new(),
                         width: 200,
                         height: if index % 2 == 0 { 150 } else { 200 },

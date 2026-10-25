@@ -1054,18 +1054,28 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
                         if ui.is_rect_visible(rect) {
                             ui.painter().rect_filled(rect, 6.0, palette.surface);
-                            // Hovering plays a small WebP preview; the still
-                            // stays underneath while it decodes or fails.
-                            let playing = gif
-                                .animated
-                                .as_ref()
-                                .filter(|_| response.hovered())
-                                .and_then(|path| {
-                                    match crate::animation::frame(ui, path, rect, true) {
+                            if !app.gif_pending
+                                && gif.animated.is_none()
+                                && !app.gif_requested.contains(&gif.id)
+                                && let Some((url, extension)) = &gif.animated_source
+                            {
+                                app.gif_requested.insert(gif.id.clone());
+                                app.actions.push(Action::FetchGifAnimation {
+                                    id: gif.id.clone(),
+                                    url: url.clone(),
+                                    extension: extension.clone(),
+                                });
+                            }
+                            // Visible tiles play; the animation player pauses
+                            // tiles that are off screen. The still stays
+                            // underneath while a preview decodes or fails.
+                            let playing =
+                                gif.animated.as_ref().and_then(
+                                    |path| match crate::animation::frame(ui, path, rect, true) {
                                         crate::animation::Frame::Ready(texture) => Some(texture),
                                         _ => None,
-                                    }
-                                });
+                                    },
+                                );
                             if let Some(texture) = playing {
                                 egui::Image::from_texture(egui::load::SizedTexture::new(
                                     texture.id(),
