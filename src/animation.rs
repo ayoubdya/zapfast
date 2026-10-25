@@ -472,7 +472,15 @@ fn decode_mp4_from<R: std::io::Read + std::io::Seek>(
             track.sample_count(),
         )
     };
-    let mut decoder = openh264::decoder::Decoder::new().ok()?;
+    // Flushing after every packet, the default, breaks streams with
+    // B-frames: the decoder then gives up at the first one. Reordered frames
+    // come out on their own and the rest with `flush_remaining`.
+    let mut decoder = openh264::decoder::Decoder::with_api_config(
+        openh264::OpenH264API::from_source(),
+        openh264::decoder::DecoderConfig::new()
+            .flush_after_decode(openh264::decoder::Flush::NoFlush),
+    )
+    .ok()?;
     let mut frames: Vec<(ColorImage, Duration)> = Vec::new();
     let mut delays: std::collections::VecDeque<Duration> = std::collections::VecDeque::new();
     // Send parameter sets and samples to the decoder in Annex B format.
@@ -867,9 +875,11 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=duration=0.5:size=64x48:rate=10",
+                "testsrc=duration=2:size=64x48:rate=10",
             ])
-            .args(["-pix_fmt", "yuv420p"])
+            // B-frames used to break the decoder after a handful of samples,
+            // so a clip looped as only those frames.
+            .args(["-c:v", "libx264", "-bf", "2", "-pix_fmt", "yuv420p"])
             .arg(&path)
             .status()
             .is_ok_and(|status| status.success());
@@ -878,9 +888,11 @@ mod tests {
             return;
         }
         let decoded = decode(&path, MAX_FRAMES).expect("decodes");
-        // Five frames at 10 fps. The in-process path preserves their timing.
-        assert_eq!(decoded.frames.len(), 5);
+        // Twenty frames at 10 fps, including every one after a B-frame.
+        assert_eq!(decoded.frames.len(), 20);
         assert_eq!(decoded.frames[0].1, Duration::from_millis(100));
+        let total: Duration = decoded.frames.iter().map(|(_, delay)| *delay).sum();
+        assert_eq!(total, Duration::from_secs(2), "the whole loop plays");
         assert_eq!(decoded.frames[0].0.size, [64, 48]);
         let _ = std::fs::remove_dir_all(dir);
     }
