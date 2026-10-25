@@ -12112,8 +12112,12 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
             if !still_needed && !animated_needed {
                 continue;
             }
-            let still = still.take();
-            let animated = animated.take();
+            let still = if still_needed { still.take() } else { None };
+            let animated = if animated_needed {
+                animated.take()
+            } else {
+                None
+            };
             let still_slot = &mut gif.still;
             let animated_slot = &mut gif.animated;
             scope.spawn(move || {
