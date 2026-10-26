@@ -129,7 +129,8 @@ by sender, time, and a short summary.
 **Development builds** can star messages. Right-click a message and choose
 **Star**; once WhatsApp confirms it, a small star shows beside the message's
 time. Stars made on your phone or another linked device show up here too, and
-the other way round. The star near the foot of the rail on the left of the chat list, above
+the other way round. Stars made before your copy of ZapFast followed them are
+read from the phone once, the next time it connects. The star near the foot of the rail on the left of the chat list, above
 **Archived** and **Settings**, opens
 **Starred**, which lists every starred message, newest star first, with its
 chat's name and when it was starred. Text shows as written; a photo, video,
@@ -240,6 +241,12 @@ it is, choose **Send as document** in the plus menu beside the message field
 instead. The files you select there go as documents with their own name and
 bytes, pictures included, and show as files above the composer until you send
 them.
+
+Videos go as playable video messages only when they are MP4. WhatsApp does
+not deliver a video message in another format, and ZapFast does not convert
+videos, so a QuickTime `.mov`, WebM, MKV, or AVI file goes as a document
+instead and arrives as the original file. Audio works the same way: MP3, M4A,
+AAC, AMR, and OGG go as audio messages, other formats as documents.
 
 Staged attachments stay with their chat, along with their caption and reply,
 when you switch chats or accounts, and come back when you return. Unlike text
@@ -453,7 +460,12 @@ the speed of the other chats again. When a voice message ends, playback carries 
 voice messages right after it that you have not heard yet, as on the phone;
 any other message ends the run. The speaker's pitch stays the same at every
 speed. The first play sends
-a played receipt. When the composer is empty, the send button becomes a
+a played receipt, so your phone marks the voice message as heard. With read
+receipts off in your account privacy, the receipt goes only to your own
+devices and the sender is not told. With **Send read receipts** off in
+ZapFast's settings, no played receipt is sent. A voice message you have not
+heard yet shows a dot beside its length; it goes away once you play it here or
+on another device. When the composer is empty, the send button becomes a
 microphone. The light beside the time turns red, and the time starts, once the
 microphone delivers sound: one the system had put to sleep can take a moment to
 wake, and anything said before then is not recorded. Press Enter or the send
@@ -616,8 +628,9 @@ Click a message result to jump to it, or a contact to start a chat. Use
 `Alt+↑/↓`, or `Ctrl+Shift+[` and `Ctrl+Shift+]` as in WhatsApp, to switch chats
 without leaving the composer (Command instead of Ctrl on macOS), and
 `Ctrl+1` through `Ctrl+9` to open the chat at that position in the list. Within an open
-chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` jump to the top or
-the newest message (when the input is empty).
+chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` (or `Ctrl+End`)
+jump to the top or the newest message when the input is empty. With text in
+the input, they move the text cursor as in any editor.
 
 With a mouse that has them, the **Back** and **Forward** side buttons step
 through the places you have visited, as in a browser: between chats, and
@@ -867,3 +880,24 @@ shortcuts.
 ZapFast announces confirmations, errors, connection changes and history loading
 through the screen reader without moving focus. While the app is locked, only
 connection and history changes are announced.
+
+Each message, or album, is exposed as one item that reads its sender, text,
+time and delivery status, then any quote, forward, edit and reactions; the
+first message of a day starts with the day and the first unread one with
+Unread.
+
+The messages form one list, named for the chat, such as "Messages with Ada" or
+"Messages in Rust Berlin", and each message, or album, reports its position in
+it. The list is a single Tab stop: Alt+2 (Control+2 on macOS) also moves there.
+In the list, Up and Down move one item, Home and End go to the oldest loaded
+and the newest message, and PgUp and PgDn move about a screen; Home on the
+oldest loaded message loads older history. The current message stays put when
+new messages arrive, and follows when ZapFast itself takes you to a message:
+the next voice message playing on, a quoted message, or a search result. After
+keyboard navigation it is outlined like any other focused control.
+
+In the chat view, Tab moves through the message input and its buttons, phone
+numbers in messages, chat search, the chat info panel, the message list, the
+rail, the chat list's header, search and the chat filters, then returns to the
+input. Shift+Tab goes back; hidden controls are skipped. Single messages,
+reactions and chat rows are not stops; Alt+Up/Down switches conversations.

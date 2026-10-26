@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 use whatsapp_rust::download::MediaType;
 use whatsapp_rust::features::PresencePolicy;
 use whatsapp_rust::features::message_edit::{
-    SecretEncKind, decrypt_secret_encrypted_with_fallback, extract_secret_encrypted,
+    SecretEncKind, decrypt_secret_encrypted_with_fallback, extract_envelope,
+    extract_secret_encrypted,
 };
 use whatsapp_rust::media::{
     AudioOptions, DocumentOptions, ImageOptions, VideoOptions, audio_message, document_message,
@@ -42,6 +43,7 @@ mod calls;
 mod channel_pictures;
 mod contact_names;
 mod device_store;
+mod download_folders;
 mod early_events;
 use early_events::WaitingReaction;
 mod favorite_chats;
@@ -52,6 +54,7 @@ mod new_group;
 mod poll_history;
 mod polls;
 mod prefetch;
+mod star_recovery;
 mod sticker_pace;
 mod stickers;
 
@@ -192,7 +195,7 @@ async fn download_attachment(
     path: &Path,
     limit: u64,
 ) -> Result<PathBuf, String> {
-    fetch_attachment(client, downloadable, dir, path, limit, false).await
+    fetch_attachment(client, downloadable, dir, path, limit, false, None).await
 }
 
 /// [`download_attachment`], and with `keep_others` a file already at `path`
@@ -205,14 +208,13 @@ async fn fetch_attachment(
     path: &Path,
     limit: u64,
     keep_others: bool,
+    cache: Option<&Path>,
 ) -> Result<PathBuf, String> {
     if downloadable.file_length().is_some_and(|size| size > limit) {
         return Err(ATTACHMENT_LIMIT_ERROR.to_owned());
     }
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|error| error.to_string())?;
-    let (temporary, file) = temporary_attachment_file(path)?;
+    debug_assert_eq!(path.parent(), Some(dir));
+    let (target, temporary, file) = stage_attachment(path, cache).await?;
     let _staged = Staged(temporary.clone());
     let result = client
         .download_to_writer(
@@ -227,15 +229,7 @@ async fn fetch_attachment(
             drop(writer);
             // The staging file is removed on the way out if it was not
             // published.
-            if keep_others {
-                publish_beside(&temporary, path)
-                    .await
-                    .map_err(|error| error.to_string())
-            } else {
-                publish_attachment(&temporary, path)
-                    .await
-                    .map(|()| path.to_path_buf())
-            }
+            publish_download(&temporary, &target, keep_others && target == path, cache).await
         }
         Err(error) => {
             let error = error.to_string();
@@ -244,6 +238,63 @@ async fn fetch_attachment(
             } else {
                 Err(error)
             }
+        }
+    }
+}
+
+/// Opens the actual staging file before downloading, trying the cache on local failure.
+async fn stage_attachment(
+    path: &Path,
+    cache: Option<&Path>,
+) -> Result<(PathBuf, PathBuf, std::fs::File), String> {
+    let mut failure = String::new();
+    for target in std::iter::once(path).chain(cache.filter(|cache| *cache != path)) {
+        let staged = async {
+            let dir = target.parent().ok_or("attachment has no parent folder")?;
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|error| error.to_string())?;
+            temporary_attachment_file(target)
+        }
+        .await;
+        match staged {
+            Ok((temporary, file)) => return Ok((target.to_owned(), temporary, file)),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// A publication failure saves the verified bytes in the cache without another transfer.
+async fn publish_download(
+    temporary: &Path,
+    path: &Path,
+    keep_others: bool,
+    cache: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let published = if keep_others {
+        publish_beside(temporary, path)
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        publish_attachment(temporary, path)
+            .await
+            .map(|()| path.to_owned())
+    };
+    match published {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let Some(cache) = cache.filter(|cache| *cache != path) else {
+                return Err(error);
+            };
+            let (_, staging, file) = stage_attachment(cache, None).await?;
+            let _staged = Staged(staging.clone());
+            drop(file);
+            tokio::fs::copy(temporary, &staging)
+                .await
+                .map_err(|error| error.to_string())?;
+            publish_attachment(&staging, cache).await?;
+            Ok(cache.to_owned())
         }
     }
 }
@@ -566,6 +617,42 @@ async fn receipts_allowed(
     }
 }
 
+/// Whether a played receipt for a direct message goes out. With read
+/// receipts on it goes to the sender. With them off WhatsApp still tells our
+/// own devices, as `played-self`, so the phone stops marking the voice message
+/// unheard (#501); whatsapp-rust sends that form when it knows they are off
+/// (`library_hides`). While it does not know yet, nothing goes, so the sender
+/// never learns of a play the account hides.
+fn played_receipt_goes(account_allows: bool, library_hides: bool) -> bool {
+    account_allows || library_hides
+}
+
+/// Like `receipts_allowed`, for a played receipt: see `played_receipt_goes`.
+async fn played_receipt_allowed(
+    client: &Client,
+    jid: &Jid,
+    commands: &mpsc::UnboundedSender<Command>,
+) -> bool {
+    if jid.is_group() {
+        return true;
+    }
+    match client.fetch_privacy_settings().await {
+        Ok(settings) => {
+            let allowed = account_allows_receipts(&settings);
+            let _ = commands.send(Command::ReceiptsPrivacy { disabled: !allowed });
+            let hides = client
+                .persistence_manager()
+                .get_device_snapshot()
+                .read_receipts_disabled;
+            played_receipt_goes(allowed, hides)
+        }
+        Err(error) => {
+            log::debug!("played receipt withheld: account privacy unavailable: {error}");
+            false
+        }
+    }
+}
+
 /// A sticker file's size and modification time, with the emojis read from it.
 type EmojiStamp = ((u64, Option<std::time::SystemTime>), Vec<String>);
 
@@ -733,6 +820,17 @@ pub async fn run(
             && archive
                 .set_meta(contact_names::FIRST_NAMES_RECOVERED, "complete")
                 .is_ok());
+    // Only stars synced before ZapFast followed them were consumed unseen.
+    let stars_recovered = archive
+        .meta(star_recovery::STARS_RECOVERED)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("complete")
+        || (archive.chats().is_ok_and(|chats| chats.is_empty())
+            && archive
+                .set_meta(star_recovery::STARS_RECOVERED, "complete")
+                .is_ok());
     let mut worker = Worker {
         privacy_ready: privacy_confirmed,
         privacy_confirmed,
@@ -786,6 +884,7 @@ pub async fn run(
         group_info_retry: Vec::new(),
         presence_subscribed: HashSet::new(),
         download_folder: None,
+        cleaned_download_folders: HashSet::new(),
         keep_chats_archived: true,
         phone_unarchive_chats,
         phone_unarchive_unread,
@@ -818,6 +917,8 @@ pub async fn run(
         favorites_recovering: false,
         first_names_recovered,
         first_names_recovering: false,
+        stars_recovered,
+        stars_recovering: false,
         downloads: HashSet::new(),
         read_sync: ReadSync::default(),
         favorite_chats: Default::default(),
@@ -1217,6 +1318,8 @@ struct Worker {
     presence_subscribed: HashSet<String>,
     /// Chosen folder for new downloads, when not the cache.
     download_folder: Option<PathBuf>,
+    /// Clean each chosen root once, before this worker can start downloads there.
+    cleaned_download_folders: HashSet<PathBuf>,
     /// Settings' "Keep chats archived", for an account whose phone has not
     /// sent its own. Off, a new message unarchives its chat here, as the
     /// phone does; WhatsApp sends no mutation for it.
@@ -1291,6 +1394,10 @@ struct Worker {
     first_names_recovered: bool,
     /// That replay is running.
     first_names_recovering: bool,
+    /// The phone's stars from before ZapFast followed them were replayed.
+    stars_recovered: bool,
+    /// That replay is running.
+    stars_recovering: bool,
     /// Active attachment downloads by chat, message id, and carousel card.
     downloads: HashSet<(ChatId, String, Option<usize>)>,
     /// Serial forward in flight. The next send waits for the running one.
@@ -1525,6 +1632,19 @@ struct ParsedMessage {
     /// The phone's per-recipient receipts for one of our messages. A group's
     /// list may name only some of its members.
     receipts: Vec<wa::UserReceipt>,
+    /// An edit made before linking that history carries encrypted with the
+    /// original's secret (#582). The worker opens it before filing, and the
+    /// row's body comes from it; one it cannot open is not filed.
+    sealed_edit: Option<SealedEdit>,
+}
+
+/// An encrypted MESSAGE_EDIT from history, still to be opened. Its message
+/// is filed under the edited message's id, as a full snapshot.
+struct SealedEdit {
+    payload: Vec<u8>,
+    iv: Vec<u8>,
+    /// The history entry's own message secret, which may be the original's.
+    entry_secret: Option<Vec<u8>>,
 }
 
 /// How many of a chat's newest messages are searched for one the phone has.
@@ -2635,20 +2755,31 @@ impl Worker {
         }
     }
 
-    /// Where a new download goes: the chosen folder while it can be
-    /// created, otherwise the cache, so an unplugged drive does not stop
-    /// downloads.
-    fn download_dir(&self) -> PathBuf {
-        match &self.download_folder {
-            Some(folder) if std::fs::create_dir_all(folder).is_ok() && folder.is_dir() => {
-                folder.clone()
+    /// New downloads use account/chat folders inside the chosen destination.
+    /// An unavailable destination falls back to the cache, so an unplugged
+    /// drive does not stop downloads.
+    fn download_dir(&self, chat: &str) -> PathBuf {
+        if let Some(root) = &self.download_folder {
+            let chat = self.canonical_str(chat);
+            let name = self
+                .contact_name(&chat)
+                .or_else(|| {
+                    self.archive
+                        .chat(&chat)
+                        .ok()
+                        .flatten()
+                        .map(|chat| chat.name)
+                })
+                .unwrap_or_else(|| self.chat_name(&chat, None));
+            let account =
+                download_folders::account_folder(root, &self.dirs.id, self.me_pn.as_deref());
+            let folder = download_folders::chat_folder(&self.archive, &account, &chat, &name);
+            if download_folders::create_folder(root, &folder).is_ok() {
+                return folder;
             }
-            Some(_) => {
-                log::warn!("the download folder is unavailable; using the cache");
-                self.dirs.media_cache_dir()
-            }
-            None => self.dirs.media_cache_dir(),
+            log::warn!("the download folder is unavailable; using the cache");
         }
+        self.dirs.media_cache_dir()
     }
 
     fn set_online(&mut self, online: bool) {
@@ -3462,6 +3593,7 @@ impl Worker {
                 self.fetch_missing_favorites();
                 self.recover_favorites();
                 self.recover_first_names();
+                self.recover_stars();
                 let _ = self.archive.retry_poll_votes();
                 self.pump_poll_votes();
                 if let Some(client) = self.client.clone() {
@@ -4039,17 +4171,21 @@ impl Worker {
             ReceiptType::Read => Delivery::Read,
             ReceiptType::Played => Delivery::Played,
             ReceiptType::ReadSelf | ReceiptType::PlayedSelf => {
+                let played = receipt.r#type == ReceiptType::PlayedSelf;
                 // The receipt time is when the phone read, not the position
                 // it read through. A delayed receipt must leave newer messages.
                 for id in &receipt.message_ids {
                     match self.archive.message(&chat, id) {
                         Ok(Some(message)) if !message.from_me => {
                             let _ = self.archive.mark_read_to(&chat, id);
+                            if played {
+                                self.store_played(&chat, id);
+                            }
                         }
                         // Offline, messages are filed in batches after their
                         // receipts: the read applies once the message is.
                         Ok(None) if !receipt.source.chat.is_status_broadcast() => {
-                            self.early.wait_read(&chat, id);
+                            self.early.wait_read(&chat, id, played);
                         }
                         _ => {}
                     }
@@ -4792,16 +4928,99 @@ impl Worker {
         let Ok(Some(message)) = self.archive.message(chat, id) else {
             return false;
         };
-        let read = self.early.take_read(chat, id) && !message.from_me;
-        if read {
+        let read = self.early.take_read(chat, id).filter(|_| !message.from_me);
+        if read.is_some() {
             let _ = self.archive.mark_read_to(chat, id);
+        }
+        if read == Some(true) {
+            self.store_played(chat, id);
         }
         for waiting in self.early.take_reactions(chat, id) {
             // The sender's privacy id may have been mapped since.
             let sender = self.canonical_str(&waiting.sender);
             self.apply_reaction(chat, id, &sender, waiting.from_me, waiting.body, None);
         }
-        read
+        read.is_some()
+    }
+
+    /// Files an incoming voice message as played, here or on another device,
+    /// and tells the interface when that is news.
+    fn store_played(&self, chat: &str, id: &str) {
+        match self.archive.mark_played(chat, id) {
+            Ok(true) => self.emit_message(chat, id),
+            Ok(false) => {}
+            Err(error) => log::warn!("could not store a played voice message: {error}"),
+        }
+    }
+
+    /// Opens an edit history carries encrypted (#582) with the secret of the
+    /// message it edits: from this chunk, the archive, or the history entry
+    /// itself. Only the author edits a message, so the author is both the
+    /// original's sender and the editor, by phone number or privacy id.
+    /// Returns the edited body and the secret that opened it.
+    fn open_history_edit(
+        &self,
+        chat: &str,
+        target: &str,
+        sender: Option<&str>,
+        from_me: bool,
+        edit: &SealedEdit,
+        secrets: &HashMap<String, Vec<u8>>,
+    ) -> Option<(wa::Message, Vec<u8>)> {
+        let (author, fallback) = if from_me {
+            let pn = self.me_pn.as_deref().and_then(Self::jid_of);
+            let lid = self.me_lid.as_deref().and_then(Self::jid_of);
+            match (pn, lid) {
+                (Some(pn), lid) => (pn, lid),
+                (None, Some(lid)) => (lid, None),
+                (None, None) => return None,
+            }
+        } else {
+            let author = Self::jid_of(sender.unwrap_or(chat))?;
+            let fallback = self.alt_jid(&author);
+            (author, fallback)
+        };
+        let archived = self
+            .archive
+            .raw(chat, target)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(message_secret_from_raw);
+        let mut tried: Vec<&[u8]> = Vec::new();
+        for secret in [
+            secrets.get(target).map(Vec::as_slice),
+            archived.as_deref(),
+            edit.entry_secret.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if secret.len() != 32 || tried.contains(&secret) {
+                continue;
+            }
+            tried.push(secret);
+            let Ok(inner) = decrypt_secret_encrypted_with_fallback(
+                &edit.payload,
+                &edit.iv,
+                secret,
+                SecretEncKind::MessageEdit,
+                target,
+                &author,
+                &author,
+                fallback.as_ref(),
+                fallback.as_ref(),
+            ) else {
+                continue;
+            };
+            let body = inner
+                .protocol_message
+                .into_option()?
+                .edited_message
+                .into_option()?;
+            return Some((body, secret.to_vec()));
+        }
+        None
     }
 
     fn apply_history_reaction(
@@ -5457,10 +5676,43 @@ impl Worker {
             let mut removed = 0;
             let mut failed = 0;
             let mut secrets = HashMap::new();
-            for message in chat.messages {
+            let mut sealed = 0;
+            let mut unopened = 0;
+            // The chunk's own secrets first: an encrypted edit may come
+            // before the original it was made with.
+            for message in &chat.messages {
+                if let Some(secret) = message
+                    .poll_secret
+                    .as_deref()
+                    .filter(|secret| secret.len() == 32)
+                {
+                    secrets.insert(message.id.clone(), secret.to_vec());
+                }
+            }
+            for mut message in chat.messages {
                 if self.message_was_removed(&id, &message.id) {
                     removed += 1;
                     continue;
+                }
+                if let Some(edit) = message.sealed_edit.take() {
+                    sealed += 1;
+                    let Some((body, secret)) = self.open_history_edit(
+                        &id,
+                        &message.id,
+                        message.sender.as_deref(),
+                        message.from_me,
+                        &edit,
+                        &secrets,
+                    ) else {
+                        // Without the original's secret there is nothing
+                        // to show; the original, if filed, stays as it was.
+                        unopened += 1;
+                        continue;
+                    };
+                    if !fill_from_edit(&mut message, &body, secret) {
+                        unopened += 1;
+                        continue;
+                    }
                 }
                 if let Some(secret) = message
                     .poll_secret
@@ -5573,6 +5825,12 @@ impl Worker {
                 let mut existed = false;
                 let mut live_location_changed = false;
                 let existing = self.archive.message(&id, &row.id).ok().flatten();
+                // A transcript already on screen is not paged again, so a
+                // status history moves forward, such as a voice message the
+                // phone played, is sent to it.
+                let status_advanced = existing
+                    .as_ref()
+                    .is_some_and(|existing| existing.status < row.status);
                 // What the info panel listed for this row before it lands,
                 // so a change to its pictures, documents or links is told.
                 let before = existing.as_ref().map(|existing| existing.content.clone());
@@ -5603,7 +5861,7 @@ impl Worker {
                     failed += 1;
                     log::warn!("could not store a history message: {error}");
                 } else {
-                    if live_location_changed {
+                    if live_location_changed || status_advanced {
                         self.emit_message(&id, &row.id);
                     }
                     self.retire_local_call_twins(&row);
@@ -5635,6 +5893,9 @@ impl Worker {
                 log::info!(
                     "history reload: archived added={added}, repeated={repeated}, removed={removed}, failed={failed}"
                 );
+            }
+            if sealed > 0 {
+                log::info!("history: encrypted edits={sealed}, not opened={unopened}");
             }
             for reaction in chat.reactions {
                 self.apply_history_reaction(&id, reaction, &secrets);
@@ -6587,6 +6848,7 @@ impl Worker {
             Command::FavoriteFetched { hash, result } => self.favorite_fetched(&hash, result),
             Command::FavoritesRecovered { complete } => self.favorites_recovered(complete),
             Command::FirstNamesRecovered { complete } => self.first_names_recovered(complete),
+            Command::StarsRecovered { complete } => self.stars_recovered(complete),
             Command::ImportStickerUrl { url } => {
                 let commands = self.commands.clone();
                 let packs = self.packs_dir();
@@ -6605,8 +6867,11 @@ impl Worker {
             }
             Command::SetDownloadFolder(folder) => {
                 // Interrupted downloads leave hidden staging files behind.
-                if let Some(folder) = &folder {
+                if let Some(folder) = &folder
+                    && self.cleaned_download_folders.insert(folder.clone())
+                {
                     discard_attachment_staging(folder);
+                    download_folders::discard_staging(folder, &self.dirs.id, self.me_pn.as_deref());
                 }
                 self.download_folder = folder;
             }
@@ -7171,6 +7436,7 @@ impl Worker {
                 sender,
                 receipts,
             } => {
+                self.store_played(&chat, &message);
                 if receipts {
                     self.mark_played(chat, message, sender);
                 }
@@ -9037,13 +9303,15 @@ impl Worker {
             }
             None
         };
-        let dir = self.download_dir();
+        let dir = self.download_dir(&chat);
+        let cache = self.dirs.media_cache_dir();
         // In the reader's own folder a document keeps the name it was sent
         // with (#363); the cache keeps names unique by message.
         let own_folder = dir != self.dirs.media_cache_dir();
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let cache_id = card.map_or_else(|| id.clone(), |index| format!("{id}-card-{index}"));
+            let cache_path = media_path(&cache, &chat, &cache_id, &mime, file_name.as_deref());
             let named = file_name
                 .as_deref()
                 .filter(|_| own_folder)
@@ -9052,8 +9320,16 @@ impl Worker {
             let path = named
                 .unwrap_or_else(|| media_path(&dir, &chat, &cache_id, &mime, file_name.as_deref()));
             let result = with_attachment_deadline(deadline, async {
-                match fetch_attachment(&client, &*downloadable, &dir, &path, limit, keep_others)
-                    .await
+                match fetch_attachment(
+                    &client,
+                    &*downloadable,
+                    &dir,
+                    &path,
+                    limit,
+                    keep_others,
+                    Some(&cache_path),
+                )
+                .await
                 {
                     Ok(path) => Ok(path),
                     Err(error) => {
@@ -9087,6 +9363,7 @@ impl Worker {
                                                     &path,
                                                     limit,
                                                     keep_others,
+                                                    Some(&cache_path),
                                                 )
                                                 .await
                                             }
@@ -10293,7 +10570,7 @@ impl Worker {
         };
         let commands = self.commands.clone();
         tokio::spawn(async move {
-            if !receipts_allowed(&client, &jid, &commands).await {
+            if !played_receipt_allowed(&client, &jid, &commands).await {
                 return;
             }
             if let Err(error) = client
@@ -11764,6 +12041,15 @@ fn whatsapp_audio_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether an attached video goes as a video message. Phones play only MP4
+/// inline, and WhatsApp drops a video message in another container (a
+/// QuickTime `.mov`, WebM, MKV, AVI) without telling either side, so the
+/// recipient gets nothing (#553). Those go as documents and arrive as the
+/// original file; ZapFast does not transcode.
+fn whatsapp_video_mime(mime: &str) -> bool {
+    mime == "video/mp4"
+}
+
 /// Uploads a file and builds its message. Images are encoded as JPEG.
 async fn prepare_media(
     client: &Client,
@@ -11772,7 +12058,6 @@ async fn prepare_media(
     file_name: Option<&str>,
     gif: bool,
 ) -> Result<Prepared, String> {
-    let kind = mime.split('/').next().unwrap_or_default();
     let is_picture = matches!(
         mime,
         "image/jpeg" | "image/png" | "image/webp" | "image/bmp" | "image/tiff"
@@ -11824,7 +12109,7 @@ async fn prepare_media(
     }
     let size = bytes.len() as u64;
     let mime_owned = mime.to_owned();
-    if kind == "video" {
+    if whatsapp_video_mime(mime) {
         // The picture, size, and length phones show before downloading it.
         // Reading a second of frames takes a moment, so off the runtime.
         let poster = {
@@ -12386,6 +12671,41 @@ fn parse_history(compressed: &[u8]) -> Result<ParsedHistory, String> {
     })
 }
 
+/// Gives a history row opened from an encrypted edit the edited body, as a
+/// full snapshot: its content, reply, mentions and raw message, keeping the
+/// history entry's time and order. False when the body shows nothing.
+fn fill_from_edit(message: &mut ParsedMessage, body: &wa::Message, secret: Vec<u8>) -> bool {
+    let Some(content) = classify(body) else {
+        return false;
+    };
+    let base = body.get_base_message();
+    message.content = content;
+    message.quoted = history_quote(base);
+    message.mentions = recorded_mention_ids(base);
+    message.forwarded = forwarded_of(base);
+    message.thumbnail = thumbnail_of(base);
+    message.raw = body.encode_to_vec();
+    message.poll_secret = Some(secret);
+    message.edited = true;
+    true
+}
+
+/// The message a history message replies to, as its context names it.
+fn history_quote(base: &wa::Message) -> Option<Quoted> {
+    let context = context_of(base)?;
+    let id = context.stanza_id.clone().filter(|id| !id.is_empty())?;
+    let content = context.quoted_message.as_option().and_then(classify);
+    Some(Quoted {
+        labelled: content.as_ref().map(Content::labelled),
+        chat: context.remote_jid.clone(),
+        mentions: Vec::new(),
+        id,
+        sender: context.participant.clone().unwrap_or_default(),
+        sender_name: None,
+        summary: content.as_ref().map(Content::summary).unwrap_or_default(),
+    })
+}
+
 /// Converts supported protocol message content into local display types, retaining quoted source metadata.
 fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
     let mut diagnostics = HistoryDiagnostics {
@@ -12439,6 +12759,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
                     poll_secret: None,
                     poll_votes: Vec::new(),
                     receipts: Vec::new(),
+                    sealed_edit: None,
                 });
                 continue;
             }
@@ -12598,7 +12919,37 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
             });
             continue;
         }
-        let Some(mut content) = classify(message) else {
+        // An edit WhatsApp encrypted with the original's secret: the worker
+        // opens it, and it is filed under the original's id like the plain
+        // snapshots above (#582).
+        let sealed = snapshot
+            .is_none()
+            .then(|| extract_envelope(original.get_base_message()))
+            .flatten()
+            .and_then(|envelope| {
+                let target = envelope.target_id().filter(|id| !id.is_empty())?;
+                Some((
+                    target.to_owned(),
+                    SealedEdit {
+                        payload: envelope.enc_payload.to_vec(),
+                        iv: envelope.enc_iv.to_vec(),
+                        entry_secret: info.message_secret.clone(),
+                    },
+                ))
+            });
+        let (id, edited, sealed) = match sealed {
+            Some((target, sealed)) => (target, true, Some(sealed)),
+            None => (id, edited, None),
+        };
+        let content = match classify(message) {
+            Some(content) => Some(content),
+            // A placeholder the opened edit replaces.
+            None if sealed.is_some() => Some(Content::Unsupported {
+                what: "edited message".into(),
+            }),
+            None => None,
+        };
+        let Some(mut content) = content else {
             diagnostics.unclassified += 1;
             continue;
         };
@@ -12628,6 +12979,9 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
                 Some(Status::ERROR) => Delivery::Failed,
                 _ => Delivery::Sent,
             }
+        } else if info.status == Some(Status::PLAYED) {
+            // We played their voice message on another device.
+            Delivery::Played
         } else {
             Delivery::None
         };
@@ -12654,19 +13008,7 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
                 status = Delivery::Delivered;
             }
         }
-        let quoted = context_of(base).and_then(|context| {
-            let id = context.stanza_id.clone().filter(|id| !id.is_empty())?;
-            let content = context.quoted_message.as_option().and_then(classify);
-            Some(Quoted {
-                labelled: content.as_ref().map(Content::labelled),
-                chat: context.remote_jid.clone(),
-                mentions: Vec::new(),
-                id,
-                sender: context.participant.clone().unwrap_or_default(),
-                sender_name: None,
-                summary: content.as_ref().map(Content::summary).unwrap_or_default(),
-            })
-        });
+        let quoted = history_quote(base);
         let reactions = info
             .reactions
             .iter()
@@ -12702,25 +13044,31 @@ fn parse_conversation(conversation: wa::Conversation) -> ParsedChat {
                 message
             }
             .encode_to_vec(),
-            poll_secret: info.message_secret.clone().or_else(|| {
-                original
-                    .message_context_info
-                    .as_option()
-                    .and_then(|context| context.message_secret.clone())
-                    .or_else(|| {
-                        original
-                            .get_base_message()
-                            .message_context_info
-                            .as_option()
-                            .and_then(|context| context.message_secret.clone())
-                    })
-            }),
+            // An opened edit's secret is the one that opened it.
+            poll_secret: if sealed.is_some() {
+                None
+            } else {
+                info.message_secret.clone().or_else(|| {
+                    original
+                        .message_context_info
+                        .as_option()
+                        .and_then(|context| context.message_secret.clone())
+                        .or_else(|| {
+                            original
+                                .get_base_message()
+                                .message_context_info
+                                .as_option()
+                                .and_then(|context| context.message_secret.clone())
+                        })
+                })
+            },
             poll_votes: info.poll_updates.clone(),
             receipts: if from_me {
                 info.user_receipt.clone()
             } else {
                 Vec::new()
             },
+            sealed_edit: sealed,
         });
     }
     let last_activity = conversation
@@ -13191,6 +13539,33 @@ mod tests {
         // phone, not as the file that was attached (#162).
         for document in ["take.wav", "album.flac", "loop.aiff", "old.wma", "x.weba"] {
             assert_eq!(sent_as(document), None, "{document}");
+        }
+    }
+
+    #[test]
+    fn a_played_receipt_reaches_our_own_devices_with_read_receipts_off() {
+        // Read receipts on: the sender is told.
+        assert!(played_receipt_goes(true, false));
+        // Off, and whatsapp-rust knows: it sends played-self, to our own
+        // devices only, so the phone marks the message heard (#501).
+        assert!(played_receipt_goes(false, true));
+        // Off, but the library does not know yet: it would tell the sender.
+        assert!(!played_receipt_goes(false, false));
+    }
+
+    #[test]
+    fn only_mp4_video_is_sent_as_a_video_message() {
+        let video = |name: &str| {
+            let mime = mime_guess2::from_path(name)
+                .first_or_octet_stream()
+                .to_string();
+            whatsapp_video_mime(&mime)
+        };
+        assert!(video("clip.mp4"));
+        // WhatsApp drops these as video messages, so the recipient got
+        // nothing (#553); they go as documents instead.
+        for document in ["clip.mov", "clip.webm", "clip.mkv", "clip.avi", "clip.wmv"] {
+            assert!(!video(document), "{document}");
         }
     }
 
@@ -15295,15 +15670,211 @@ mod tests {
         worker
             .handle_command(Command::SetDownloadFolder(Some(chosen.clone())))
             .await;
-        assert_eq!(worker.download_dir(), chosen);
+        let chat = "200@s.whatsapp.net";
+        worker.archive.ensure_chat(chat, "Alice").unwrap();
+        let expected =
+            download_folders::account_folder(&chosen, &worker.dirs.id, worker.me_pn.as_deref())
+                .join("Alice");
+        assert_eq!(worker.download_dir(chat), expected);
+        assert!(
+            expected.is_dir(),
+            "account and chat folders are created when needed"
+        );
         assert!(chosen.is_dir(), "the folder is created when needed");
         // A folder that cannot exist, such as one below a file, falls back.
         std::fs::write(root.join("file"), b"").unwrap();
         worker.download_folder = Some(root.join("file/inside"));
-        assert_eq!(worker.download_dir(), worker.dirs.media_cache_dir());
+        assert_eq!(worker.download_dir(chat), worker.dirs.media_cache_dir());
         worker.download_folder = None;
-        assert_eq!(worker.download_dir(), worker.dirs.media_cache_dir());
+        assert_eq!(worker.download_dir(chat), worker.dirs.media_cache_dir());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Canonical phone and privacy ids name the same destination, including groups.
+    #[test]
+    fn download_folders_use_canonical_chat_names() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        let root = tempfile::tempdir().unwrap();
+        worker.download_folder = Some(root.path().to_owned());
+        let chat = "200@s.whatsapp.net";
+        worker.archive.ensure_chat(chat, "Alice").unwrap();
+        worker.learn_lid("9", "200");
+        let path = worker.download_dir(chat);
+        assert_eq!(path, worker.download_dir("9@lid"));
+        assert_eq!(path.file_name().unwrap(), "Alice");
+
+        let group = "100-200@g.us";
+        worker.archive.ensure_chat(group, "Family").unwrap();
+        assert_eq!(worker.download_dir(group).file_name().unwrap(), "Family");
+
+        // Another chat with the same name gets its own folder beside it.
+        let namesake = "300@s.whatsapp.net";
+        worker.archive.ensure_chat(namesake, "Alice").unwrap();
+        assert_eq!(
+            worker.download_dir(namesake).file_name().unwrap(),
+            "Alice (2)"
+        );
+        assert_eq!(worker.download_dir(chat), path);
+
+        // An inaccessible nested chat folder also uses the ordinary cache.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"blocked").unwrap();
+        assert_eq!(worker.download_dir(chat), worker.dirs.media_cache_dir());
+    }
+
+    /// The account's folder is its phone number, whichever form of our own
+    /// identity WhatsApp reports, and the privacy id alone never moves it.
+    #[test]
+    fn the_account_download_folder_stays_put_across_identity_forms() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        let root = tempfile::tempdir().unwrap();
+        worker.download_folder = Some(root.path().to_owned());
+        let chat = "200@s.whatsapp.net";
+        worker.archive.ensure_chat(chat, "Alice").unwrap();
+        worker.me_pn = Some("15550001111@s.whatsapp.net".into());
+        worker.me_lid = None;
+        let first = worker.download_dir(chat);
+        assert_eq!(first, root.path().join("+15550001111").join("Alice"));
+        worker.me_lid = Some("1001@lid".into());
+        assert_eq!(worker.download_dir(chat), first);
+        worker.me_pn = Some("15550001111:3@s.whatsapp.net".into());
+        assert_eq!(worker.download_dir(chat), first);
+    }
+
+    /// Publication stays beside the destination, preserving names without a cache export.
+    #[tokio::test]
+    async fn organized_downloads_publish_once_without_overwriting() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        let root = tempfile::tempdir().unwrap();
+        worker.download_folder = Some(root.path().to_owned());
+        let chat = "200@s.whatsapp.net";
+        worker.archive.ensure_chat(chat, "Alice").unwrap();
+        let dir = worker.download_dir(chat);
+        let path = named_media_path(&dir, "application/pdf", "report.pdf").unwrap();
+        std::fs::write(&path, b"existing").unwrap();
+        let (temporary, file) = temporary_attachment_file(&path).unwrap();
+        drop(file);
+        std::fs::write(&temporary, b"download").unwrap();
+        let published = publish_beside(&temporary, &path).await.unwrap();
+        assert_eq!(published, dir.join("report (1).pdf"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        assert_eq!(std::fs::read(&published).unwrap(), b"download");
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        assert!(!worker.dirs.media_cache_dir().join("report.pdf").exists());
+        assert!(
+            !worker
+                .dirs
+                .media_cache_dir()
+                .join("report (1).pdf")
+                .exists()
+        );
+    }
+
+    /// Existing account/chat links must fall back without creating anything outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn linked_download_directories_use_the_cache() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        worker.download_folder = Some(root.path().to_owned());
+        let chat = "200@s.whatsapp.net";
+        worker.archive.ensure_chat(chat, "Alice").unwrap();
+        let folder =
+            download_folders::account_folder(root.path(), &worker.dirs.id, worker.me_pn.as_deref())
+                .join("Alice");
+        let account = folder.parent().unwrap();
+        std::os::unix::fs::symlink(outside.path(), account).unwrap();
+        assert_eq!(worker.download_dir(chat), worker.dirs.media_cache_dir());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        std::fs::remove_file(account).unwrap();
+        std::fs::create_dir(account).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &folder).unwrap();
+        assert_eq!(worker.download_dir(chat), worker.dirs.media_cache_dir());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// Selecting an already-used root must not sweep a download started in this session.
+    #[tokio::test]
+    async fn chosen_folder_cleanup_runs_once_per_account_and_root() {
+        let (mut worker, _events, _, _) = receipt_tests::worker();
+        let root = tempfile::tempdir().unwrap();
+        let dir =
+            download_folders::account_folder(root.path(), &worker.dirs.id, worker.me_pn.as_deref())
+                .join("Alice");
+        std::fs::create_dir_all(&dir).unwrap();
+        let partial = dir.join(".photo.0123456789abcdef.part");
+        std::fs::write(&partial, b"old").unwrap();
+        worker
+            .handle_command(Command::SetDownloadFolder(Some(root.path().to_owned())))
+            .await;
+        assert!(
+            !partial.exists(),
+            "a restarted worker clears crash leftovers"
+        );
+        std::fs::write(&partial, b"active").unwrap();
+        worker
+            .handle_command(Command::SetDownloadFolder(None))
+            .await;
+        worker
+            .handle_command(Command::SetDownloadFolder(Some(root.path().to_owned())))
+            .await;
+        assert_eq!(std::fs::read(&partial).unwrap(), b"active");
+    }
+
+    /// A local staging failure switches to a writable cache before any network transfer.
+    #[tokio::test]
+    async fn unavailable_staging_uses_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let path = blocked.join("report.pdf");
+        let cache = root.path().join("cache/message.pdf");
+        assert!(stage_attachment(&path, None).await.is_err());
+        let (actual, temporary, file) = stage_attachment(&path, Some(&cache)).await.unwrap();
+        let staged = Staged(temporary.clone());
+        assert_eq!(actual, cache);
+        assert_eq!(temporary.parent(), cache.parent());
+        drop(file);
+        drop(staged);
+        assert!(!temporary.exists());
+        std::fs::write(root.path().join("cache-blocked"), b"blocked").unwrap();
+        assert!(
+            stage_attachment(&path, Some(&root.path().join("cache-blocked/file")))
+                .await
+                .is_err()
+        );
+    }
+
+    /// A late publication failure preserves the verified bytes in one finished cache file.
+    #[tokio::test]
+    async fn failed_publication_uses_verified_bytes_in_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let temporary = root.path().join(".verified.0123456789abcdef.part");
+        let staged = Staged(temporary.clone());
+        std::fs::write(&temporary, b"verified fixture").unwrap();
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"keep").unwrap();
+        let path = blocked.join("report.pdf");
+        let cache = root.path().join("cache/message.pdf");
+        assert!(
+            publish_download(&temporary, &path, true, None)
+                .await
+                .is_err()
+        );
+        let saved = publish_download(&temporary, &path, true, Some(&cache))
+            .await
+            .unwrap();
+        assert_eq!(saved, cache);
+        assert_eq!(std::fs::read(&saved).unwrap(), b"verified fixture");
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"keep");
+        drop(staged);
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read_dir(cache.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]
@@ -17609,6 +18180,7 @@ mod receipt_tests {
             group_info_retry: Vec::new(),
             presence_subscribed: HashSet::new(),
             download_folder: None,
+            cleaned_download_folders: HashSet::new(),
             keep_chats_archived: true,
             phone_unarchive_chats: None,
             phone_unarchive_unread: false,
@@ -17641,6 +18213,8 @@ mod receipt_tests {
             favorites_recovering: false,
             first_names_recovered: true,
             first_names_recovering: false,
+            stars_recovered: true,
+            stars_recovering: false,
             downloads: HashSet::new(),
             read_sync: ReadSync::default(),
             favorite_chats: Default::default(),
@@ -18817,6 +19391,211 @@ mod receipt_tests {
         assert_eq!(parsed.messages[0].timestamp, 100);
     }
 
+    /// An edit WhatsApp sealed with the original's secret, as history carries
+    /// one made before linking (#582). The author edits, so the author is
+    /// both the original's sender and the editor.
+    fn sealed_edit(target: &str, author: &str, secret: &[u8], text: &str) -> wa::Message {
+        use whatsapp_rust::wacore::message_edit::{MessageEditContext, encrypt_message_edit};
+        let inner = {
+            let mut proto = wa::Message::default();
+            proto.protocol_message = MessageField::some({
+                let mut proto = wa::message::ProtocolMessage::default();
+                proto.r#type = Some(wa::message::protocol_message::Type::MESSAGE_EDIT);
+                proto.key = MessageField::some({
+                    let mut proto = wa::MessageKey::default();
+                    proto.id = Some(target.into());
+                    proto
+                });
+                proto.edited_message = MessageField::some(wa::Message::text(text));
+                proto
+            });
+            proto
+        };
+        let (payload, iv) = encrypt_message_edit(
+            &inner,
+            secret,
+            &MessageEditContext {
+                original_msg_id: target,
+                original_sender_jid: author,
+                editor_jid: author,
+            },
+        )
+        .unwrap();
+        let mut proto = wa::Message::default();
+        proto.secret_encrypted_message = MessageField::some({
+            let mut proto = wa::message::SecretEncryptedMessage::default();
+            proto.secret_enc_type =
+                Some(wa::message::secret_encrypted_message::SecretEncType::MESSAGE_EDIT);
+            proto.target_message_key = MessageField::some({
+                let mut proto = wa::MessageKey::default();
+                proto.id = Some(target.into());
+                proto.remote_jid = Some(author.into());
+                proto
+            });
+            proto.enc_payload = Some(payload);
+            proto.enc_iv = Some(iv.to_vec());
+            proto
+        });
+        proto
+    }
+
+    #[test]
+    fn history_parses_a_sealed_edit_under_its_original() {
+        let secret = [7u8; 32];
+        let parsed = parse_conversation({
+            let mut proto = wa::Conversation::default();
+            proto.id = PEER.into();
+            proto.messages = vec![history_entry(
+                PEER,
+                "edit-envelope",
+                false,
+                None,
+                sealed_edit("original-id", PEER, &secret, "Edited fixture"),
+                Vec::new(),
+                None,
+            )];
+            proto
+        });
+        assert_eq!(parsed.diagnostics.unclassified, 0);
+        assert_eq!(parsed.diagnostics.encrypted_edits, 1);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].id, "original-id");
+        assert!(parsed.messages[0].edited);
+        assert!(parsed.messages[0].sealed_edit.is_some());
+        assert!(parsed.messages[0].poll_secret.is_none());
+    }
+
+    #[test]
+    fn history_files_a_sealed_edit_without_its_original() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let secret = vec![9u8; 32];
+        // The phone's entry for the edited message names its secret.
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "edit-envelope",
+                false,
+                None,
+                sealed_edit("original-id", PEER, &secret, "Edited fixture"),
+                Vec::new(),
+                Some(secret.clone()),
+            )],
+        );
+        let row = worker
+            .archive
+            .message(PEER, "original-id")
+            .unwrap()
+            .expect("the edited message is filed under its own id");
+        assert_eq!(row.content, Content::text("Edited fixture"));
+        assert!(row.edited);
+        assert_eq!(row.timestamp, 100);
+        assert!(
+            worker
+                .archive
+                .message(PEER, "edit-envelope")
+                .unwrap()
+                .is_none()
+        );
+        // Its secret stays with it, so later reactions to it can be opened.
+        let raw = worker.archive.raw(PEER, "original-id").unwrap().unwrap();
+        assert_eq!(message_secret_from_raw(&raw), Some(secret));
+    }
+
+    #[test]
+    fn history_applies_a_sealed_edit_with_the_archived_originals_secret() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        let secret = vec![5u8; 32];
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "original-id",
+                false,
+                None,
+                wa::Message::text("Before editing"),
+                Vec::new(),
+                Some(secret.clone()),
+            )],
+        );
+        // A later chunk carries the edit alone, without a secret of its own.
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "edit-envelope",
+                false,
+                None,
+                sealed_edit("original-id", PEER, &secret, "Edited fixture"),
+                Vec::new(),
+                None,
+            )],
+        );
+        let row = worker
+            .archive
+            .message(PEER, "original-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.content, Content::text("Edited fixture"));
+        assert!(row.edited);
+        // A replay of the original does not undo it.
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "original-id",
+                false,
+                None,
+                wa::Message::text("Before editing"),
+                Vec::new(),
+                Some(secret),
+            )],
+        );
+        let row = worker
+            .archive
+            .message(PEER, "original-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.content, Content::text("Edited fixture"));
+    }
+
+    #[test]
+    fn history_leaves_a_sealed_edit_it_cannot_open() {
+        let (mut worker, _events, _inbox, _wa) = worker();
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "original-id",
+                false,
+                None,
+                wa::Message::text("Before editing"),
+                Vec::new(),
+                None,
+            )],
+        );
+        // Sealed with a secret nobody here knows.
+        file_history_entries(
+            &mut worker,
+            vec![history_entry(
+                PEER,
+                "edit-envelope",
+                false,
+                None,
+                sealed_edit("original-id", PEER, &[3u8; 32], "Edited fixture"),
+                Vec::new(),
+                Some(vec![4u8; 32]),
+            )],
+        );
+        let row = worker
+            .archive
+            .message(PEER, "original-id")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.content, Content::text("Before editing"));
+        assert!(!row.edited);
+    }
+
     // WA Web 2.3000.1045368834, whatspec 1a441f0329c941fcdb238490a6c604550d8a9939:
     // WAWebParseHistorySyncProtocolMessageEditProto keeps base metadata, parses
     // editedMessage, then replaces id with protocol.key. The outer key identifies
@@ -19452,6 +20231,86 @@ mod receipt_tests {
         assert_eq!(
             parsed(PEER, Status::SERVER_ACK).messages[0].status,
             Delivery::Read
+        );
+    }
+
+    #[test]
+    fn history_keeps_their_voice_message_played_on_the_phone() {
+        use wa::web_message_info::Status;
+        let parsed = |status| {
+            parse_conversation({
+                let mut proto = wa::Conversation::default();
+                proto.id = PEER.into();
+                proto.messages = vec![{
+                    let mut proto = wa::HistorySyncMsg::default();
+                    proto.message = MessageField::some({
+                        let mut proto = wa::WebMessageInfo::default();
+                        proto.key = MessageField::some({
+                            let mut proto = wa::MessageKey::default();
+                            proto.id = Some("voice".into());
+                            proto.from_me = Some(false);
+                            proto
+                        });
+                        proto.message = MessageField::some({
+                            let mut proto = wa::Message::default();
+                            proto.audio_message = MessageField::some({
+                                let mut proto = wa::message::AudioMessage::default();
+                                proto.ptt = Some(true);
+                                proto
+                            });
+                            proto
+                        });
+                        proto.status = Some(status);
+                        proto
+                    });
+                    proto
+                }];
+                proto
+            })
+            .messages[0]
+                .status
+        };
+        assert_eq!(parsed(Status::PLAYED), Delivery::Played);
+        assert_eq!(parsed(Status::READ), Delivery::None);
+        assert_eq!(parsed(Status::DELIVERY_ACK), Delivery::None);
+    }
+
+    #[test]
+    fn history_tells_the_transcript_of_a_voice_message_played_since() {
+        use wa::web_message_info::Status;
+        let (mut worker, events, _inbox, _wa) = worker();
+        let entry = |status| {
+            let mut entry = history_entry(
+                PEER,
+                "voice",
+                false,
+                None,
+                {
+                    let mut proto = wa::Message::default();
+                    proto.audio_message = MessageField::some({
+                        let mut proto = wa::message::AudioMessage::default();
+                        proto.ptt = Some(true);
+                        proto
+                    });
+                    proto
+                },
+                Vec::new(),
+                None,
+            );
+            entry.message.as_option_mut().unwrap().status = Some(status);
+            entry
+        };
+        file_history_entries(&mut worker, vec![entry(Status::DELIVERY_ACK)]);
+        while events.try_recv().is_ok() {}
+        // A replay that says the phone played it updates the row on screen.
+        file_history_entries(&mut worker, vec![entry(Status::PLAYED)]);
+        let told = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, Event::MessageUpdated(message)
+                if message.id == "voice" && message.status == Delivery::Played)
+        });
+        assert!(
+            told,
+            "the played voice message was not sent to the transcript"
         );
     }
 
@@ -20640,6 +21499,54 @@ mod receipt_tests {
         );
         worker.on_receipt(&receipt(PEER_LID, &["new"], ReceiptType::ReadSelf));
         assert_eq!(unread(&worker), 0);
+    }
+
+    #[tokio::test]
+    async fn a_voice_message_played_here_or_on_the_phone_is_kept_as_heard() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let status =
+            |worker: &Worker, id: &str| worker.archive.message(PEER, id).unwrap().unwrap().status;
+        worker.store_message(incoming("phone", 100), None, None);
+        worker.store_message(incoming("here", 200), None, None);
+        worker.store_message(own_message("ours", 300), None, None);
+        while events.try_recv().is_ok() {}
+
+        worker.on_receipt(&receipt(PEER, &["phone"], ReceiptType::PlayedSelf));
+        assert_eq!(status(&worker, "phone"), Delivery::Played);
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::MessageUpdated(message) if message.id == "phone"
+        )));
+
+        worker
+            .handle_command(Command::MarkPlayed {
+                chat: PEER.into(),
+                message: "here".into(),
+                sender: PEER.into(),
+                receipts: false,
+            })
+            .await;
+        assert_eq!(
+            status(&worker, "here"),
+            Delivery::Played,
+            "heard here even without sending receipts"
+        );
+
+        worker.on_receipt(&receipt(PEER, &["ours"], ReceiptType::PlayedSelf));
+        assert_eq!(
+            status(&worker, "ours"),
+            Delivery::Sent,
+            "our own keeps its ticks"
+        );
+
+        // Offline, the phone's play can come before its message.
+        worker.on_receipt(&receipt(PEER, &["early"], ReceiptType::PlayedSelf));
+        worker.store_message(incoming("early", 400), None, None);
+        assert_eq!(status(&worker, "early"), Delivery::Played);
+
+        // A replay of the message does not undo it.
+        worker.store_message(incoming("phone", 100), None, None);
+        assert_eq!(status(&worker, "phone"), Delivery::Played);
     }
 
     #[test]
@@ -22033,6 +22940,7 @@ mod chat_removal_tests {
                         poll_secret: None,
                         poll_votes: Vec::new(),
                         receipts: Vec::new(),
+                        sealed_edit: None,
                     })
                     .collect(),
                 revoked: Vec::new(),

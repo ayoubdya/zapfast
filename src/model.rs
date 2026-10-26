@@ -2629,6 +2629,14 @@ pub enum Action {
         chat: ChatId,
         message: String,
     },
+    /// A downloaded picture or sticker at `path` could not be drawn: its file
+    /// is gone, and it downloads again like any other attachment, or it does
+    /// not decode, and its bubble offers a retry.
+    UnreadableMedia {
+        chat: ChatId,
+        message: String,
+        path: PathBuf,
+    },
     /// Downloads a motion photo's clip.
     DownloadMotion {
         chat: ChatId,
@@ -3012,6 +3020,10 @@ pub enum Action {
     ScrollToBottom,
     /// Scrolls the open chat by about a page, or to the top of its history.
     ScrollPage(Scroll),
+    /// Moves the open chat's current message, from its focused message list.
+    MessageCursor(crate::ui::list_nav::Step),
+    /// Gives the open chat's message list keyboard focus.
+    FocusMessages,
     /// Scrolls the open chat to a message.
     ScrollTo(String),
     /// Updates chat-list search text.
