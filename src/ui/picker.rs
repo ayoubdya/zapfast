@@ -1069,13 +1069,18 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                             // Visible tiles play; the animation player pauses
                             // tiles that are off screen. The still stays
                             // underneath while a preview decodes or fails.
-                            let playing =
-                                gif.animated.as_ref().and_then(
-                                    |path| match crate::animation::frame(ui, path, rect, true) {
-                                        crate::animation::Frame::Ready(texture) => Some(texture),
-                                        _ => None,
-                                    },
-                                );
+                            let playing = gif.animated.as_ref().and_then(|path| {
+                                match crate::animation::frame_with_cache(
+                                    ui,
+                                    path,
+                                    rect,
+                                    true,
+                                    egui::Id::new("gif-picker"),
+                                ) {
+                                    crate::animation::Frame::Ready(texture) => Some(texture),
+                                    _ => None,
+                                }
+                            });
                             if let Some(texture) = playing {
                                 egui::Image::from_texture(egui::load::SizedTexture::new(
                                     texture.id(),
