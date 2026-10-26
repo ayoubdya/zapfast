@@ -12163,7 +12163,8 @@ fn gif_rendition(images: &serde_json::Value) -> Option<(String, &'static str)> {
 
 /// Downloads one GIF thumbnail, returning its path once written.
 fn fetch_gif(url: &str, path: &Path) -> Option<PathBuf> {
-    let bytes = ureq::get(url)
+    let bytes = crate::proxy::agent()
+        .get(url)
         .call()
         .and_then(|mut response| response.body_mut().read_to_vec())
         .ok()?;
