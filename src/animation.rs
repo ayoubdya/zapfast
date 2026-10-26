@@ -20,6 +20,8 @@ const MAX_WIDTH: u32 = 320;
 const MAX_FRAMES: usize = 150;
 /// Time an unseen animation remains decoded.
 const IDLE: Duration = Duration::from_secs(20);
+/// A playing animation not drawn within this window has left the viewport.
+const VISIBLE: Duration = Duration::from_millis(500);
 /// Maximum concurrent decoders.
 const MAX_DECODERS: usize = 2;
 /// Global texture-frame budget. Least-recently-used animations are removed first.
@@ -50,10 +52,9 @@ struct Playing {
     /// another place, such as a chat bubble behind the sticker viewer, must
     /// not restart it from the first frame on every pass.
     played_in: u64,
-    /// Whether every frame is decoded. A paused animation decodes only its
-    /// poster: a picker full of animated stickers would otherwise hold more
-    /// frames than the budget, and each decode would evict a visible tile that
-    /// then decodes again, flickering endlessly (#165).
+    /// Whether every frame is decoded. Paused animations can fall back to
+    /// their poster under the shared budget; playing visible animations keep
+    /// their frames until they leave the viewport.
     complete: bool,
     /// A decode of every frame is running for this poster.
     upgrading: bool,
@@ -88,16 +89,26 @@ type Delivery = (PathBuf, Option<Decoded>, bool);
 #[derive(Clone, Default)]
 struct Inbox(Arc<Mutex<Vec<Delivery>>>);
 
+#[cfg(test)]
 fn cache(ctx: &egui::Context) -> Cache {
+    cache_for(ctx, egui::Id::new("default"))
+}
+
+fn cache_for(ctx: &egui::Context, scope: egui::Id) -> Cache {
     ctx.data_mut(|data| {
-        data.get_temp_mut_or_default::<Cache>(egui::Id::new("animations"))
+        data.get_temp_mut_or_default::<Cache>(egui::Id::new(("animations", scope)))
             .clone()
     })
 }
 
+#[cfg(test)]
 fn inbox(ctx: &egui::Context) -> Inbox {
+    inbox_for(ctx, egui::Id::new("default"))
+}
+
+fn inbox_for(ctx: &egui::Context, scope: egui::Id) -> Inbox {
     ctx.data_mut(|data| {
-        data.get_temp_mut_or_default::<Inbox>(egui::Id::new("animation-inbox"))
+        data.get_temp_mut_or_default::<Inbox>(egui::Id::new(("animation-inbox", scope)))
             .clone()
     })
 }
@@ -117,14 +128,35 @@ pub enum Frame {
 /// A visible but paused animation returns its first frame without scheduling
 /// another repaint. This keeps animated media idle until playback is wanted.
 pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Frame {
+    frame_with_cache(ui, path, rect, animate, egui::Id::new("default"))
+}
+
+/// Returns an animation frame from a separate cache.
+pub fn frame_with_cache(
+    ui: &egui::Ui,
+    path: &Path,
+    rect: egui::Rect,
+    animate: bool,
+    scope: egui::Id,
+) -> Frame {
+    frame_inner(ui, path, rect, animate, scope)
+}
+
+fn frame_inner(
+    ui: &egui::Ui,
+    path: &Path,
+    rect: egui::Rect,
+    animate: bool,
+    scope: egui::Id,
+) -> Frame {
     // ScrollArea still lays out clipped rows. They must neither start decoders
     // nor keep the window repainting while their pixels are off screen.
     if !ui.is_rect_visible(rect) {
         return Frame::Pending;
     }
     let ctx = ui.ctx();
-    let cache = cache(ctx);
-    let inbox = inbox(ctx);
+    let cache = cache_for(ctx, scope);
+    let inbox = inbox_for(ctx, scope);
     // Upload decoded frames on the UI thread.
     let arrived: Vec<Delivery> =
         std::mem::take(&mut *inbox.0.lock().unwrap_or_else(|p| p.into_inner()));
@@ -144,7 +176,7 @@ pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Fra
             }
             Some(decoded) if !decoded.frames.is_empty() => {
                 let mut total = Duration::ZERO;
-                let frames = decoded
+                let frames: Vec<_> = decoded
                     .frames
                     .into_iter()
                     .enumerate()
@@ -154,12 +186,13 @@ pub fn frame(ui: &egui::Ui, path: &Path, rect: egui::Rect, animate: bool) -> Fra
                         (ctx.load_texture(name, image, TextureOptions::LINEAR), delay)
                     })
                     .collect();
+                let animating = complete && frames.len() > 1;
                 Entry::Ready(Playing {
                     frames,
                     total: total.max(Duration::from_millis(50)),
                     started: Instant::now(),
                     last_drawn: Instant::now(),
-                    animating: false,
+                    animating,
                     played_in: 0,
                     complete,
                     upgrading: false,
@@ -602,9 +635,8 @@ pub(crate) fn video_frame(path: &Path, index: usize) -> Option<ColorImage> {
 }
 
 /// Trims animations until the resident frames fit the budget, sparing the
-/// one being drawn. What the last sweep found idle goes first; an animation
-/// drawn since only drops back to its poster, so a tile that is still on
-/// screen never flashes its placeholder, and posters go last.
+/// one being drawn and any animation still playing on screen. Paused entries
+/// lose their decoded frames; unseen entries are evicted.
 fn enforce_budget(animations: &mut Animations, path: &Path, now: Instant) {
     let mut resident: usize = animations
         .entries
@@ -619,12 +651,15 @@ fn enforce_budget(animations: &mut Animations, path: &Path, now: Instant) {
             .entries
             .iter()
             .filter(|(entry_path, entry)| {
-                entry_path.as_path() != path && matches!(entry, Entry::Ready(_))
+                entry_path.as_path() != path
+                    && matches!(entry, Entry::Ready(playing)
+                        if !playing.animating
+                            || now.duration_since(playing.last_drawn) >= VISIBLE)
             })
             .min_by_key(|(entry_path, entry)| match entry {
                 Entry::Ready(playing) => (
                     u8::from(!animations.idle.contains(*entry_path)),
-                    u8::from(playing.frames.len() == 1),
+                    u8::from(playing.animating),
                     playing.last_drawn,
                 ),
                 _ => (1, 1, now),
@@ -633,14 +668,13 @@ fn enforce_budget(animations: &mut Animations, path: &Path, now: Instant) {
         let Some(victim) = victim else {
             break;
         };
-        let idle = animations.idle.contains(&victim);
         match animations.entries.get_mut(&victim) {
-            Some(Entry::Ready(playing)) if !idle && playing.frames.len() > 1 => {
+            Some(Entry::Ready(playing)) if !playing.animating && playing.frames.len() > 1 => {
                 resident -= playing.frames.len() - 1;
+                playing.total = playing.frames[0].1;
                 playing.frames.truncate(1);
                 playing.complete = false;
                 playing.upgrading = false;
-                playing.animating = false;
             }
             Some(Entry::Ready(playing)) => {
                 resident -= playing.frames.len();
