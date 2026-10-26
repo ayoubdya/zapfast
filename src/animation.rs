@@ -89,7 +89,6 @@ type Delivery = (PathBuf, Option<Decoded>, bool);
 #[derive(Clone, Default)]
 struct Inbox(Arc<Mutex<Vec<Delivery>>>);
 
-#[cfg(test)]
 fn cache(ctx: &egui::Context) -> Cache {
     cache_for(ctx, egui::Id::new("default"))
 }
