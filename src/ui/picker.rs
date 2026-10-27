@@ -1059,7 +1059,6 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                                 && !app.gif_requested.contains(&gif.id)
                                 && let Some((url, extension)) = &gif.animated_source
                             {
-                                app.gif_requested.insert(gif.id.clone());
                                 app.actions.push(Action::FetchGifAnimation {
                                     id: gif.id.clone(),
                                     url: url.clone(),

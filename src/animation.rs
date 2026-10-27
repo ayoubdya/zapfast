@@ -1354,6 +1354,98 @@ mod tests {
         assert!(!old.complete, "it decodes again when it next plays");
     }
 
+    #[test]
+    fn a_visible_playing_animation_keeps_its_frames_past_the_budget() {
+        let ctx = egui::Context::default();
+        let old = PathBuf::from("visible-old.gif");
+        let new = PathBuf::from("visible-new.gif");
+        let count = MAX_RESIDENT_FRAMES / 2 + 1;
+        let old_frames: Vec<_> = (0..count)
+            .map(|index| {
+                (
+                    ctx.load_texture(
+                        format!("visible-old-{index}"),
+                        ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+                        TextureOptions::LINEAR,
+                    ),
+                    Duration::from_millis(50),
+                )
+            })
+            .collect();
+        {
+            let store = cache(&ctx);
+            let mut animations = store.0.lock().expect("animation cache");
+            animations.entries.insert(
+                old.clone(),
+                Entry::Ready(Playing {
+                    frames: old_frames,
+                    total: Duration::from_secs(10),
+                    started: Instant::now(),
+                    last_drawn: Instant::now(),
+                    animating: true,
+                    played_in: 0,
+                    complete: true,
+                    upgrading: false,
+                }),
+            );
+            // No sweep is due during this frame.
+            animations.last_sweep = Some(Instant::now());
+        }
+        inbox(&ctx).0.lock().expect("inbox").push((
+            new.clone(),
+            Some(Decoded {
+                frames: (0..count)
+                    .map(|_| {
+                        (
+                            ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+                            Duration::from_millis(50),
+                        )
+                    })
+                    .collect(),
+            }),
+            true,
+        ));
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(50.0, 50.0), egui::Sense::hover());
+                assert!(matches!(frame(ui, &new, rect, true), Frame::Ready(_)));
+            },
+        );
+        output.textures_delta.clear();
+        let store = cache(&ctx);
+        let animations = store.0.lock().expect("animation cache");
+        for path in [&old, &new] {
+            let Some(Entry::Ready(playing)) = animations.entries.get(path) else {
+                panic!("{} is not resident", path.display());
+            };
+            assert_eq!(
+                playing.frames.len(),
+                count,
+                "a playing animation on screen keeps every frame"
+            );
+        }
+        assert!(
+            animations
+                .entries
+                .values()
+                .map(|entry| match entry {
+                    Entry::Ready(playing) => playing.frames.len(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+                > MAX_RESIDENT_FRAMES,
+            "the budget gives way to what is on screen"
+        );
+    }
+
     /// WhatsApp stickers can carry their EXIF metadata ahead of the animation.
     #[test]
     fn a_sticker_with_metadata_before_its_frames_still_plays() {

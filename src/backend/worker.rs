@@ -100,6 +100,8 @@ const ATTACHMENT_LIMIT_ERROR: &str =
 
 /// The deadline of a download of unknown or small size.
 const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// A GIPHY request or GIF thumbnail download must finish within this time.
+const GIF_TIMEOUT: Duration = Duration::from_secs(30);
 /// The slowest transfer the deadline allows for beyond that: 128 KiB/s, so a
 /// 2 GiB video still has over four hours.
 const ATTACHMENT_SLOWEST_RATE: u64 = 128 * 1024;
@@ -12321,7 +12323,13 @@ fn search_gifs(query: &str, key: &str, dir: &Path) -> Result<Vec<Gif>, GifError>
             percent_encode(query.trim())
         )
     };
-    let body = match crate::proxy::agent().get(&url).call() {
+    let body = match crate::proxy::agent()
+        .get(&url)
+        .config()
+        .timeout_global(Some(GIF_TIMEOUT))
+        .build()
+        .call()
+    {
         Ok(mut response) => response
             .body_mut()
             .read_to_string()
@@ -12450,6 +12458,9 @@ fn gif_rendition(images: &serde_json::Value) -> Option<(String, &'static str)> {
 fn fetch_gif(url: &str, path: &Path) -> Option<PathBuf> {
     let bytes = crate::proxy::agent()
         .get(url)
+        .config()
+        .timeout_global(Some(GIF_TIMEOUT))
+        .build()
         .call()
         .and_then(|mut response| response.body_mut().read_to_vec())
         .ok()?;
