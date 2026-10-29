@@ -264,7 +264,10 @@ opens over the window with the region to keep marked, and you can drag that
 region by its edges and corners or move it whole. **Turn left** and **Turn
 right** turn the picture a quarter at a time, and **Reset** puts it back the way
 it started. Press Enter or click the check to keep the crop, or Escape or the
-close button to leave the picture as it was.
+close button to leave the picture as it was. Opened from the keyboard, the
+cropper puts focus on the check (**Keep this crop**), Tab moves between its
+buttons, and Enter or Space presses the focused one, so Enter on the close
+button cancels. The region itself moves and resizes with the pointer only.
 
 Keeping a crop does not change the file you picked. ZapFast writes the cropped
 picture beside its other media and sends that one, keeping any see-through
@@ -865,6 +868,9 @@ window is open behind others also highlights ZapFast in the taskbar until you
 switch to it. GNOME and Hyprland get no highlight: GNOME would show a second
 notice, and Hyprland can bring the window to the front instead. Muted chats do not send notifications, and
 archived chats stay quiet while they remain archived. You can change both settings.
+With several numbers linked, the bell beside a number in the account switcher
+mutes all of that number's notifications while it stays connected, and leaves
+its unread chats out of the app icon's badge, as a muted chat's are.
 To keep messages off the screen, turn off **Show message content in
 notifications** in Settings: notifications then say only "New message".
 To hear less from busy chats, set **Limit repeat notifications** in
@@ -896,8 +902,28 @@ new messages arrive, and follows when ZapFast itself takes you to a message:
 the next voice message playing on, a quoted message, or a search result. After
 keyboard navigation it is outlined like any other focused control.
 
+Shift+F10 opens the current message's menu with focus on its first item; Tab,
+Shift+Tab, Up and Down move through the menu, and Escape closes it and returns
+to the list. The Applications key does not work yet: egui does not report it.
+In this menu, as in any other, typing a letter moves to the next item whose
+name starts with it without choosing it, and the same letter again moves on.
+Opened from the keyboard, the menu also lists a card's buttons, so none of them
+needs the pointer, and what is about the message rather than in it: going to
+the replied message and the sender's info in a group. The right-click menu is
+unchanged. In the list, R replies to the current message and moves to the
+message input, E reacts to it, C copies its text (or a downloaded picture), F
+forwards it, G goes to the message it replies to, Delete (on a Mac, Delete or
+Fn+Delete) asks to delete it for you, and Shift+Delete asks to delete it for
+everyone, with the same dialog as the menu, when that is allowed; otherwise it
+says why.
+These keys wait while the chat selects messages. A call in the chat has only a
+menu to call back, which Space and Enter open too.
+
 In the chat view, Tab moves through the message input and its buttons, phone
 numbers in messages, chat search, the chat info panel, the message list, the
 rail, the chat list's header, search and the chat filters, then returns to the
 input. Shift+Tab goes back; hidden controls are skipped. Single messages,
-reactions and chat rows are not stops; Alt+Up/Down switches conversations.
+reactions and chat rows are not stops. The React and Reply buttons that
+appear beside a hovered message are for the pointer only; keyboard and
+screen-reader users reach both from the message menu. Alt+Up/Down switches
+conversations.

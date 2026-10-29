@@ -2818,10 +2818,13 @@ pub enum Action {
     /// Opens the full emoji picker to react to a message. `beside_menu` keeps
     /// the message's context menu open next to it, as when the picker comes
     /// from the menu's "+"; the hover button opens the picker alone.
+    /// `from_list`: opened by the message list's E, so closing the picker
+    /// returns focus to the list.
     OpenReactionPicker {
         chat: ChatId,
         message: String,
         beside_menu: bool,
+        from_list: bool,
     },
     /// Inserts an emoji at the composer cursor.
     InsertEmoji(String),
@@ -3024,8 +3027,16 @@ pub enum Action {
     MessageCursor(crate::ui::list_nav::Step),
     /// Gives the open chat's message list keyboard focus.
     FocusMessages,
+    /// Opens a message's context menu in the open chat, from the keyboard.
+    OpenMessageMenu(String),
+    /// The menu asked for by `OpenMessageMenu` is open: stop asking, so it
+    /// opens once and closes as any menu does.
+    MessageMenuOpened,
     /// Scrolls the open chat to a message.
     ScrollTo(String),
+    /// Goes to a replied message from the keys: as `ScrollTo`, but the
+    /// message list moves only once the message is loaded.
+    GoToReplied(String),
     /// Updates chat-list search text.
     Search(String),
     ShowUpdate,
@@ -3151,6 +3162,9 @@ pub enum Action {
     RemoveAccount(AccountId),
     /// Deletes one account's cached attachments, never its archive.
     ClearMediaCache(AccountId),
+    /// Turns one account's desktop notifications on or off, from the account
+    /// switcher, without showing that account. It stays linked either way.
+    SetAccountNotifications(AccountId, bool),
     /// Mutes until Unix time, indefinitely with `Some(0)`, or unmutes with `None`.
     SetMuted(ChatId, Option<i64>),
     /// Moves a chat into or out of the locked folder.
